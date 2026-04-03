@@ -9,22 +9,19 @@ harbor run \
   --agent-import-path agent:AgentHarness \
   -d terminal-bench@2.0 \
   -m anthropic/claude-opus-4-6 \
-  -e modal \
-  -n 20 \
+  -e daytona \
+  -n 17 \
   --n-attempts 1 \
   -o "$REPO_DIR/jobs" \
   -i adaptive-rejection-sampler \
   -i caffe-cifar-10 \
   -i db-wal-recovery \
-  -i filter-js-from-html \
   -i gpt2-codegolf \
   -i install-windows-3.11 \
   -i make-doom-for-mips \
   -i mteb-retrieve \
   -i query-optimize \
   -i raman-fitting \
-  -i sam-cell-seg \
-  -i train-fasttext \
   -i configure-git-webserver \
   -i mteb-leaderboard \
   -i schemelike-metacircular-eval \
