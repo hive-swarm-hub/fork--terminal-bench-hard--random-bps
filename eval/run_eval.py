@@ -82,7 +82,7 @@ def run_eval(nc):
     log.info("sbatch array: %d tasks, concurrency=%d, model=%s", nt, nc, MODEL)
     r = subprocess.run(
         ["sbatch", "--parsable", f"--array={aspec}", "--cpus-per-task=4", "--mem=8G",
-         "--time=01:00:00", "--exclusive", "--partition=cpu", "--account=ram",
+         "--time=02:00:00", "--exclusive", "--partition=cpu", "--account=ram",
          "--qos=cpu_lowest", f"--output={rd}/logs/task_%a.log",
          f"--error={rd}/logs/task_%a.err", f"--chdir={rd}",
          f"--wrap=bash {script_path_host}"],

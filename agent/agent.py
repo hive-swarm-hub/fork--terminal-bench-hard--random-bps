@@ -8,6 +8,7 @@ and injects it into the initial prompt.
 
 import asyncio
 import json
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -398,6 +399,8 @@ class AgentHarness(Terminus2):
             return commands, is_task_complete, feedback, analysis, plan, image_read
 
         for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
             function_name = tool_call.get("function", {}).get("name", "")
             arguments_str = tool_call.get("function", {}).get("arguments", "{}")
 
@@ -407,8 +410,34 @@ class AgentHarness(Terminus2):
                 else:
                     arguments = arguments_str
             except json.JSONDecodeError:
-                self.logger.warning(f"Failed to parse tool arguments: {arguments_str}")
-                continue
+                # Fallback: try raw_decode + regex-based commands extraction
+                try:
+                    dec = json.JSONDecoder()
+                    arguments, end_idx = dec.raw_decode(arguments_str)
+                    all_commands = []
+                    for m in re.finditer(r'"commands"\s*:\s*\[', arguments_str):
+                        start = m.end() - 1
+                        bracket_count = 0
+                        idx = start
+                        while idx < len(arguments_str):
+                            if arguments_str[idx] == '[':
+                                bracket_count += 1
+                            elif arguments_str[idx] == ']':
+                                bracket_count -= 1
+                                if bracket_count == 0:
+                                    try:
+                                        cmds = json.loads(arguments_str[start:idx+1])
+                                        all_commands.extend(cmds)
+                                    except json.JSONDecodeError:
+                                        pass
+                                    break
+                            idx += 1
+                    if all_commands:
+                        arguments['commands'] = all_commands
+                    self.logger.debug(f"Recovered tool arguments via raw_decode (used {end_idx}/{len(arguments_str)} chars)")
+                except (json.JSONDecodeError, ValueError):
+                    self.logger.warning(f"Failed to parse tool arguments: {arguments_str[:200]}")
+                    continue
 
             if function_name == "execute_commands":
                 # Extract analysis and plan
@@ -420,7 +449,7 @@ class AgentHarness(Terminus2):
                 if isinstance(cmds, str):
                     try:
                         cmds = json.loads(cmds)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, TypeError):
                         cmds = []
                 for cmd in cmds:
                     keystrokes = cmd.get("keystrokes", "")
@@ -876,16 +905,16 @@ class AgentHarness(Terminus2):
         Returns a short text block with working directory, file listing,
         available languages, and package managers. On any failure, returns
         empty string so the agent falls back to normal exploration.
+
+        Uses the tmux session (send_keys + capture_pane) instead of env.exec()
+        because env.exec() silently fails with ApptainerEnvironment.
         """
         if self._session is None:
             return ""
 
-        env = self._session.environment
-
-        # Single compound command for efficiency — each section guarded by || true
         bootstrap_cmd = (
             "echo '@@PWD@@' && pwd && "
-            "echo '@@LS@@' && ls -la /app/ 2>/dev/null && "
+            "echo '@@LS@@' && ls -la 2>/dev/null && "
             "echo '@@LANG@@' && "
             "(python3 --version 2>&1 || echo 'python3: not found') && "
             "(gcc --version 2>&1 | head -1 || echo 'gcc: not found') && "
@@ -898,18 +927,34 @@ class AgentHarness(Terminus2):
             "(pip3 --version 2>&1 || echo 'pip3: not found') && "
             "(pip --version 2>&1 || echo 'pip: not found') && "
             "(apt-get --version 2>&1 | head -1 || echo 'apt-get: not found') && "
-            "echo '@@MEM@@' && free -h 2>/dev/null | head -2 || true"
+            "echo '@@MEM@@' && free -h 2>/dev/null | head -2 || true && "
+            "echo '@@DONE@@'"
         )
 
         try:
-            result = await asyncio.wait_for(
-                env.exec(command=bootstrap_cmd, timeout_sec=15),
-                timeout=20,
+            # Clear any pending output first
+            await self._session.get_incremental_output()
+            # Send the bootstrap command via tmux
+            await self._session.send_keys(
+                bootstrap_cmd + "\n",
+                block=False,
+                min_timeout_sec=0.0,
             )
-        except Exception:
+            # Wait for @@DONE@@ marker in incremental output
+            stdout = ""
+            for _ in range(30):  # 15 seconds max
+                await asyncio.sleep(0.5)
+                new_output = await self._session.get_incremental_output()
+                stdout += new_output
+                if "@@DONE@@" in stdout:
+                    break
+            else:
+                self.logger.debug("Env snapshot timed out waiting for @@DONE@@")
+                return ""
+        except Exception as e:
+            self.logger.debug(f"Env snapshot failed: {e}")
             return ""
 
-        stdout = (result.stdout or "").strip()
         if not stdout:
             return ""
 
@@ -935,15 +980,15 @@ class AgentHarness(Terminus2):
         if "LS" in sections:
             ls_lines = sections["LS"].strip().split("\n")
             if len(ls_lines) <= 1 or (len(ls_lines) == 2 and "total 0" in ls_lines[0]):
-                parts.append("/app contents: (empty directory)")
+                parts.append("Working directory contents: (empty directory)")
             elif len(ls_lines) > 25:
                 parts.append(
-                    f"/app contents ({len(ls_lines)} entries):\n"
+                    f"Working directory contents ({len(ls_lines)} entries):\n"
                     + "\n".join(ls_lines[:20])
                     + f"\n... ({len(ls_lines) - 20} more files)"
                 )
             else:
-                parts.append(f"/app contents:\n{sections['LS'].strip()}")
+                parts.append(f"Working directory contents:\n{sections['LS'].strip()}")
         if "LANG" in sections:
             lang_lines = [
                 l.strip()
@@ -987,8 +1032,9 @@ class AgentHarness(Terminus2):
             snapshot = await self._gather_env_snapshot()
             if snapshot:
                 initial_prompt = f"{initial_prompt}\n\n{snapshot}"
-        except Exception:
-            pass  # Silent failure — don't break the agent
+        except Exception as e:
+            self.logger.warning(f"Env snapshot injection failed: {e}")
+            import traceback; self.logger.warning(traceback.format_exc())
 
         prompt = initial_prompt
 
